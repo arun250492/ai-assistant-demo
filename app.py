@@ -109,10 +109,41 @@ def fetch_emails_imap(email_addr, password):
         return [{'error': f'{type(e).__name__}: {str(e)}'}]
 
 def send_email_smtp(to_email, subject, body, in_reply_to=None):
-    """Send email via SMTP"""
-    if not gmail_creds.get('email') or not gmail_creds.get('password'):
+    """Send email via Resend API (HTTPS) - works on any platform including free tiers"""
+    if not gmail_creds.get('email'):
         return {'success': False, 'error': 'Gmail not connected'}
     
+    RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+    
+    # Try Resend first (HTTPS-based, works on free tiers)
+    if RESEND_API_KEY:
+        try:
+            import requests as req_lib
+            response = req_lib.post(
+                'https://api.resend.com/emails',
+                headers={
+                    'Authorization': f'Bearer {RESEND_API_KEY}',
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'from': f"{gmail_creds['email'].split('@')[0]} <onboarding@resend.dev>",
+                    'to': [to_email],
+                    'subject': subject,
+                    'text': body,
+                    'reply_to': gmail_creds['email']
+                },
+                timeout=15
+            )
+            if response.status_code in [200, 201]:
+                return {'success': True}
+            else:
+                error_data = response.json() if response.text else {}
+                return {'success': False, 'error': f"Resend: {error_data.get('message', response.text[:200])}"}
+        except Exception as e:
+            print(f"Resend error: {e}", flush=True)
+            # Fall through to SMTP
+    
+    # Fallback to SMTP (only works on paid Render or local)
     try:
         msg = MIMEMultipart()
         msg['From'] = gmail_creds['email']
@@ -132,7 +163,10 @@ def send_email_smtp(to_email, subject, body, in_reply_to=None):
         return {'success': True}
     except Exception as e:
         print(f"SMTP error: {e}", flush=True)
-        return {'success': False, 'error': str(e)}
+        error_str = str(e)
+        if 'unreachable' in error_str.lower() or 'timeout' in error_str.lower():
+            return {'success': False, 'error': 'SMTP blocked on this hosting platform. Add RESEND_API_KEY to environment variables. Get free key at https://resend.com/api-keys'}
+        return {'success': False, 'error': error_str}
 
 def generate_ai_reply(email_data, instruction=""):
     """Generate AI reply to an email"""
@@ -246,12 +280,12 @@ h3 { color: #667eea; margin: 10px 0; }
         <div id="chat" class="page active">
             <h2>Chat with AI</h2>
             <div class="warning-box">
-                💡 <strong>AI Agent Commands:</strong><br>
-                • "summarize my emails"<br>
-                • "reply to [sender name] saying [your instruction]"<br>
-                • "send a reply to john asking for a call"<br>
-                • "schedule meeting with arun@gmail.com tomorrow 3pm about project review"<br>
-                • Reply "send", "edit", or "cancel" to confirm actions
+                💡 <strong>What I Can Do (Full AI Email Agent):</strong><br>
+                📥 <strong>Read:</strong> "summarize my emails", "show emails from amazon"<br>
+                ↩️ <strong>Reply:</strong> "reply to john saying thanks", "send reply to emirates"<br>
+                ✉️ <strong>Compose:</strong> "send email to boss@company.com about leave request"<br>
+                📅 <strong>Schedule:</strong> "schedule meeting with arun@gmail.com tomorrow 3pm about project"<br>
+                ✅ <strong>Confirm:</strong> Reply "send", "edit", or "cancel" to confirm actions
             </div>
             <div class="chatbox" id="chatbox"></div>
             <div class="input-box">
@@ -691,6 +725,19 @@ def api_chat():
     
     msg_lower = msg.lower().strip()
     
+    # Check if user is asking about emails but Gmail not connected
+    email_keywords = ['email', 'mail', 'inbox', 'message', 'summarize', 'sender', 'amazon', 'reply', 'send', 'gmail']
+    is_email_related = any(w in msg_lower for w in email_keywords)
+    
+    if is_email_related and not gmail_creds.get('email'):
+        return jsonify({'response': '⚠️ Gmail is not connected yet. Please go to the **Gmail tab** and connect with your email + app password first, then come back here.\n\nSteps:\n1. Click "📧 Gmail" tab above\n2. Enter your Gmail address\n3. Enter your 16-character app password from https://myaccount.google.com/apppasswords\n4. Click "Connect Gmail"\n5. Come back to chat'})
+    
+    # Auto-fetch emails if user is asking about them and we don't have any
+    global cached_emails
+    if is_email_related and gmail_creds.get('email') and (not cached_emails or len(cached_emails) == 0):
+        print("Auto-fetching emails for chat context...", flush=True)
+        cached_emails = fetch_emails_imap(gmail_creds['email'], gmail_creds['password'])
+    
     # === HANDLE CONFIRMATIONS for pending actions ===
     if conversation_state.get('pending_action'):
         action = conversation_state['pending_action']
@@ -705,7 +752,7 @@ def api_chat():
             if result['success']:
                 return jsonify({'response': f"✅ Email sent successfully to {data['to']}!"})
             else:
-                return jsonify({'response': f"❌ Failed to send: {result['error']}\n\nNote: If on Hugging Face, SMTP port 465 is blocked. Deploy on Render.com or run locally."})
+                return jsonify({'response': f"❌ Failed to send: {result['error']}"})
         
         # User cancels
         if action == 'send_email' and any(w in msg_lower for w in ['no', 'cancel', 'stop', 'don\'t', 'dont', 'nope']):
@@ -785,6 +832,56 @@ def api_chat():
         
         return jsonify({'response': f"📧 Here's a draft reply to {target_email['sender']}:\n\nTo: {target_email['sender_email']}\nSubject: Re: {target_email['subject']}\n\n{reply_body}\n\n👉 Reply 'send' to send it, 'edit [your changes]' to modify, or 'cancel' to discard."})
     
+    # Detect "compose" or "send email to" - new email composition
+    compose_keywords = ['compose', 'send email to', 'send an email to', 'send mail to', 'write email to', 'email to']
+    if any(kw in msg_lower for kw in compose_keywords):
+        try:
+            # Use AI to extract recipient and what to write
+            extract_response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": """Extract email composition details from user message. Respond in JSON format only: {"to": "email@address.com", "subject": "...", "instruction": "what to write about"}.
+If user didn't specify subject, generate appropriate one based on instruction.
+If email address not found, set "to" to empty string."""},
+                    {"role": "user", "content": msg}
+                ],
+                max_tokens=200
+            )
+            import json as json_mod
+            details_text = extract_response.choices[0].message.content.strip()
+            if '{' in details_text:
+                json_start = details_text.find('{')
+                json_end = details_text.rfind('}') + 1
+                details = json_mod.loads(details_text[json_start:json_end])
+                
+                to_addr = details.get('to', '').strip()
+                if not to_addr or '@' not in to_addr:
+                    return jsonify({'response': "I need a recipient email address. Please say something like: 'send email to john@example.com about project update'"})
+                
+                # Generate email body
+                body_response = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "Write a professional email body. Output ONLY the body, no subject line. Be concise and friendly."},
+                        {"role": "user", "content": f"Write an email about: {details.get('instruction', '')}"}
+                    ],
+                    max_tokens=400
+                )
+                email_body = body_response.choices[0].message.content
+                
+                # Store pending action
+                conversation_state['pending_action'] = 'send_email'
+                conversation_state['pending_data'] = {
+                    'to': to_addr,
+                    'subject': details.get('subject', 'Message from AI Assistant'),
+                    'body': email_body
+                }
+                
+                return jsonify({'response': f"📧 Here's the email I'll send:\n\nTo: {to_addr}\nSubject: {details.get('subject', 'Message')}\n\n{email_body}\n\n👉 Reply 'send' to send it, 'edit' to modify, or 'cancel' to discard."})
+        except Exception as e:
+            print(f"Compose error: {e}", flush=True)
+            return jsonify({'response': f'Error composing email: {str(e)[:200]}'})
+    
     # Detect schedule meeting
     if any(kw in msg_lower for kw in ['schedule meeting', 'set up meeting', 'book meeting', 'arrange meeting', 'schedule a meeting']):
         try:
@@ -830,25 +927,45 @@ def api_chat():
     
     # === REGULAR CHAT with email context ===
     context = ""
-    if cached_emails and any(w in msg_lower for w in ['email', 'mail', 'inbox', 'message', 'summarize', 'sender', 'who', 'what']):
-        emails_summary = "\n".join([
-            f"{idx+1}. From {e['sender']} <{e['sender_email']}>: {e['subject']}"
-            for idx, e in enumerate(cached_emails[:10]) if not e.get('error')
-        ])
-        context = f"\n\nUser's recent emails:\n{emails_summary}\n"
+    if cached_emails and gmail_creds.get('email'):
+        valid_emails = [e for e in cached_emails if not e.get('error')]
+        
+        # Filter emails based on user query
+        relevant_emails = valid_emails
+        
+        # If user mentions a specific sender, filter
+        for em in valid_emails:
+            sender_lower = em.get('sender', '').lower()
+            sender_email_lower = em.get('sender_email', '').lower()
+            # Check for sender mention in query
+            for word in msg_lower.split():
+                if len(word) > 3 and (word in sender_lower or word in sender_email_lower):
+                    relevant_emails = [e for e in valid_emails if word in e.get('sender', '').lower() or word in e.get('sender_email', '').lower()]
+                    break
+        
+        if relevant_emails:
+            emails_summary = "\n\n".join([
+                f"Email #{idx+1}:\nFrom: {e['sender']} <{e['sender_email']}>\nSubject: {e['subject']}\nPreview: {e.get('preview', '')[:200]}"
+                for idx, e in enumerate(relevant_emails[:10])
+            ])
+            context = f"\n\n=== USER'S EMAILS (you have access to these) ===\n{emails_summary}\n=== END EMAILS ===\n"
     
     try:
         # Build conversation history
-        messages = [
-            {"role": "system", "content": f"""You are a helpful AI email assistant. You can:
-- Read and summarize emails
-- Draft and send email replies (user says 'reply to [sender]' or 'send reply to [sender]')
-- Schedule meetings (user says 'schedule meeting...')
-- Manage tasks and notes
+        system_prompt = f"""You are an AI email assistant with FULL ACCESS to the user's Gmail account ({gmail_creds.get('email', 'not connected')}).
 
-When user wants to reply or schedule, tell them what command to use.
-{context}"""},
-        ]
+You CAN:
+- Read and analyze the user's emails (provided in context below)
+- Summarize emails 
+- Suggest how to reply
+- When user wants to send a reply, tell them to say "reply to [sender]" or "send reply to [sender]"
+- When user wants to schedule, tell them to say "schedule meeting with [email] on [date/time] about [topic]"
+
+You should ALWAYS use the emails provided in the context to answer questions.
+Never say "I cannot access your emails" - you HAVE access to them through the context.
+{context}"""
+        
+        messages = [{"role": "system", "content": system_prompt}]
         
         # Add recent history (last 6 messages)
         for h in conversation_state['history'][-6:]:
@@ -859,7 +976,7 @@ When user wants to reply or schedule, tell them what command to use.
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages,
-            max_tokens=500
+            max_tokens=600
         )
         
         ai_response = response.choices[0].message.content
