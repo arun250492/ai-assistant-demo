@@ -246,7 +246,12 @@ h3 { color: #667eea; margin: 10px 0; }
         <div id="chat" class="page active">
             <h2>Chat with AI</h2>
             <div class="warning-box">
-                💡 Try: "summarize my emails", "draft a reply to [sender]", "schedule meeting tomorrow at 3pm"
+                💡 <strong>AI Agent Commands:</strong><br>
+                • "summarize my emails"<br>
+                • "reply to [sender name] saying [your instruction]"<br>
+                • "send a reply to john asking for a call"<br>
+                • "schedule meeting with arun@gmail.com tomorrow 3pm about project review"<br>
+                • Reply "send", "edit", or "cancel" to confirm actions
             </div>
             <div class="chatbox" id="chatbox"></div>
             <div class="input-box">
@@ -670,6 +675,13 @@ def api_status():
         'gmail_email': gmail_creds.get('email', '')
     })
 
+# Conversation state - tracks what the agent is doing
+conversation_state = {
+    'history': [],  # Chat history
+    'pending_action': None,  # What action is pending
+    'pending_data': {},  # Data for pending action
+}
+
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
     msg = request.json.get('message', '')
@@ -677,26 +689,189 @@ def api_chat():
     if not openai_client:
         return jsonify({'response': 'OpenAI not configured. Add OPENAI_API_KEY to environment.'})
     
-    # Check if user wants email-related action
-    msg_lower = msg.lower()
+    msg_lower = msg.lower().strip()
+    
+    # === HANDLE CONFIRMATIONS for pending actions ===
+    if conversation_state.get('pending_action'):
+        action = conversation_state['pending_action']
+        data = conversation_state['pending_data']
+        
+        # User confirms sending
+        if action == 'send_email' and any(w in msg_lower for w in ['yes', 'send', 'send it', 'confirm', 'go ahead', 'ok', 'okay', 'sure']):
+            result = send_email_smtp(data['to'], data['subject'], data['body'], data.get('message_id'))
+            conversation_state['pending_action'] = None
+            conversation_state['pending_data'] = {}
+            
+            if result['success']:
+                return jsonify({'response': f"✅ Email sent successfully to {data['to']}!"})
+            else:
+                return jsonify({'response': f"❌ Failed to send: {result['error']}\n\nNote: If on Hugging Face, SMTP port 465 is blocked. Deploy on Render.com or run locally."})
+        
+        # User cancels
+        if action == 'send_email' and any(w in msg_lower for w in ['no', 'cancel', 'stop', 'don\'t', 'dont', 'nope']):
+            conversation_state['pending_action'] = None
+            conversation_state['pending_data'] = {}
+            return jsonify({'response': "OK, I won't send that email. What else can I help with?"})
+        
+        # User wants to edit the draft
+        if action == 'send_email' and any(w in msg_lower for w in ['edit', 'change', 'modify', 'rewrite', 'different']):
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "Rewrite this email reply based on user's new instructions. Output only the new reply body."},
+                        {"role": "user", "content": f"Original draft:\n{data['body']}\n\nNew instruction: {msg}"}
+                    ],
+                    max_tokens=400
+                )
+                new_body = response.choices[0].message.content
+                conversation_state['pending_data']['body'] = new_body
+                return jsonify({'response': f"Here's the updated reply:\n\nTo: {data['to']}\nSubject: {data['subject']}\n\n{new_body}\n\n👉 Say 'send' to send it, 'edit' to modify again, or 'cancel' to discard."})
+            except Exception as e:
+                return jsonify({'response': f'Error: {str(e)[:200]}'})
+    
+    # === DETECT NEW ACTIONS ===
+    
+    # Detect "reply to [sender]" or "send reply to [email]"
+    reply_keywords = ['reply to', 'send reply', 'respond to', 'write reply', 'draft reply', 'send a reply']
+    if any(kw in msg_lower for kw in reply_keywords) or (msg_lower.startswith('send') and 'reply' in msg_lower):
+        # Find target email
+        target_email = None
+        target_index = None
+        
+        # Check if user mentions a specific sender
+        if cached_emails:
+            for idx, em in enumerate(cached_emails):
+                if em.get('error'):
+                    continue
+                sender_lower = em.get('sender', '').lower()
+                sender_email_lower = em.get('sender_email', '').lower()
+                # Match by name or email
+                if sender_lower and sender_lower in msg_lower:
+                    target_email = em
+                    target_index = idx
+                    break
+                if sender_email_lower and sender_email_lower in msg_lower:
+                    target_email = em
+                    target_index = idx
+                    break
+            
+            # If no specific match, use most recent email
+            if not target_email and cached_emails:
+                for em in cached_emails:
+                    if not em.get('error'):
+                        target_email = em
+                        break
+        
+        if not target_email:
+            return jsonify({'response': "I don't see any emails to reply to. Please connect Gmail first and load your emails."})
+        
+        # Extract instruction (everything that's not the command)
+        instruction = msg
+        for kw in reply_keywords:
+            instruction = instruction.lower().replace(kw, '').strip()
+        
+        # Generate the reply
+        reply_body = generate_ai_reply(target_email, instruction if instruction else "")
+        
+        # Store pending action
+        conversation_state['pending_action'] = 'send_email'
+        conversation_state['pending_data'] = {
+            'to': target_email['sender_email'],
+            'subject': 'Re: ' + target_email['subject'],
+            'body': reply_body,
+            'message_id': target_email.get('message_id', '')
+        }
+        
+        return jsonify({'response': f"📧 Here's a draft reply to {target_email['sender']}:\n\nTo: {target_email['sender_email']}\nSubject: Re: {target_email['subject']}\n\n{reply_body}\n\n👉 Reply 'send' to send it, 'edit [your changes]' to modify, or 'cancel' to discard."})
+    
+    # Detect schedule meeting
+    if any(kw in msg_lower for kw in ['schedule meeting', 'set up meeting', 'book meeting', 'arrange meeting', 'schedule a meeting']):
+        try:
+            extract_response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "Extract meeting details from user message. Respond in JSON format only: {\"title\": \"...\", \"with\": \"email or name\", \"time\": \"YYYY-MM-DD HH:MM\", \"notes\": \"...\"}. Use empty string for missing fields."},
+                    {"role": "user", "content": msg}
+                ],
+                max_tokens=200
+            )
+            import json as json_mod
+            details_text = extract_response.choices[0].message.content.strip()
+            # Try to extract JSON
+            if '{' in details_text:
+                json_start = details_text.find('{')
+                json_end = details_text.rfind('}') + 1
+                details = json_mod.loads(details_text[json_start:json_end])
+                
+                meetings.append({
+                    'title': details.get('title', 'Meeting'),
+                    'with_': details.get('with', ''),
+                    'time': details.get('time', ''),
+                    'notes': details.get('notes', '')
+                })
+                
+                with_who = details.get('with', '')
+                response_text = f"✅ Meeting scheduled:\n📅 {details.get('title')}\n🕒 {details.get('time')}\n👤 With: {with_who or 'TBD'}\n📝 {details.get('notes', '')}"
+                
+                # If we have an email, offer to send invite
+                if '@' in with_who:
+                    response_text += f"\n\nWant me to send an invite email to {with_who}? Reply 'yes' to send."
+                    conversation_state['pending_action'] = 'send_email'
+                    conversation_state['pending_data'] = {
+                        'to': with_who,
+                        'subject': f"Meeting Invitation: {details.get('title')}",
+                        'body': f"Hi,\n\nI'd like to schedule a meeting with you:\n\n📅 Title: {details.get('title')}\n🕒 Time: {details.get('time')}\n\n{details.get('notes', '')}\n\nPlease confirm if this works for you.\n\nBest regards"
+                    }
+                
+                return jsonify({'response': response_text})
+        except Exception as e:
+            print(f"Schedule error: {e}", flush=True)
+    
+    # === REGULAR CHAT with email context ===
     context = ""
-    if cached_emails and any(w in msg_lower for w in ['email', 'mail', 'inbox', 'message', 'summarize', 'sender']):
+    if cached_emails and any(w in msg_lower for w in ['email', 'mail', 'inbox', 'message', 'summarize', 'sender', 'who', 'what']):
         emails_summary = "\n".join([
-            f"- From {e['sender']} ({e['sender_email']}): {e['subject']}"
-            for e in cached_emails[:10] if not e.get('error')
+            f"{idx+1}. From {e['sender']} <{e['sender_email']}>: {e['subject']}"
+            for idx, e in enumerate(cached_emails[:10]) if not e.get('error')
         ])
-        context = f"\n\nRecent emails:\n{emails_summary}\n"
+        context = f"\n\nUser's recent emails:\n{emails_summary}\n"
     
     try:
+        # Build conversation history
+        messages = [
+            {"role": "system", "content": f"""You are a helpful AI email assistant. You can:
+- Read and summarize emails
+- Draft and send email replies (user says 'reply to [sender]' or 'send reply to [sender]')
+- Schedule meetings (user says 'schedule meeting...')
+- Manage tasks and notes
+
+When user wants to reply or schedule, tell them what command to use.
+{context}"""},
+        ]
+        
+        # Add recent history (last 6 messages)
+        for h in conversation_state['history'][-6:]:
+            messages.append(h)
+        
+        messages.append({"role": "user", "content": msg})
+        
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": f"You are a helpful AI assistant with access to the user's emails. Help with summarizing, drafting replies, and scheduling.{context}"},
-                {"role": "user", "content": msg}
-            ],
+            messages=messages,
             max_tokens=500
         )
-        return jsonify({'response': response.choices[0].message.content})
+        
+        ai_response = response.choices[0].message.content
+        
+        # Store in history
+        conversation_state['history'].append({"role": "user", "content": msg})
+        conversation_state['history'].append({"role": "assistant", "content": ai_response})
+        # Keep last 20 messages
+        if len(conversation_state['history']) > 20:
+            conversation_state['history'] = conversation_state['history'][-20:]
+        
+        return jsonify({'response': ai_response})
     except Exception as e:
         return jsonify({'response': f'Error: {str(e)[:200]}'})
 
